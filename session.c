@@ -180,10 +180,12 @@ static void
 auth_sock_cleanup_proc(struct passwd *pw)
 {
 	if (auth_sock_name != NULL) {
+#ifndef WINDOWS
 		temporarily_use_uid(pw);
 		unlink(auth_sock_name);
-		auth_sock_name = NULL;
 		restore_uid();
+#endif
+		auth_sock_name = NULL;
 	}
 }
 
@@ -201,6 +203,41 @@ auth_input_request_forwarding(struct ssh *ssh, struct passwd *pw, int agent_new)
 	/* Temporarily drop privileged uid for mkdir/bind. */
 	temporarily_use_uid(pw);
 
+#ifdef WINDOWS
+	{
+		struct sockaddr_un sunaddr;
+		static int agent_fwd_counter = 0;
+
+		if ((sock = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+			error("socket: %.100s", strerror(errno));
+			restore_uid();
+			goto authsock_err;
+		}
+
+		xasprintf(&auth_sock_name,
+		    "\\\\.\\pipe\\openssh-sshd-agent-%d-%d",
+		    GetCurrentProcessId(), agent_fwd_counter++);
+
+		memset(&sunaddr, 0, sizeof(sunaddr));
+		sunaddr.sun_family = AF_UNIX;
+		strlcpy(sunaddr.sun_path, auth_sock_name,
+		    sizeof(sunaddr.sun_path));
+
+		if (bind(sock, (struct sockaddr *)&sunaddr,
+		    sizeof(sunaddr)) == -1) {
+			error("bind \"%s\": %.100s",
+			    auth_sock_name, strerror(errno));
+			restore_uid();
+			goto authsock_err;
+		}
+		if (listen(sock, SSH_LISTEN_BACKLOG) == -1) {
+			error("listen \"%s\": %.100s",
+			    auth_sock_name, strerror(errno));
+			restore_uid();
+			goto authsock_err;
+		}
+	}
+#else
 	if (agent_listener(pw->pw_dir, "sshd", &sock, &auth_sock_name) != 0) {
 		/* a more detailed error is already logged */
 		ssh_packet_send_debug(ssh, "Agent forwarding disabled: "
@@ -208,6 +245,7 @@ auth_input_request_forwarding(struct ssh *ssh, struct passwd *pw, int agent_new)
 		restore_uid();
 		goto authsock_err;
 	}
+#endif
 	restore_uid();
 
 	/* Allocate a channel for the authentication agent socket. */

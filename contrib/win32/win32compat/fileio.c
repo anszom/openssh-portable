@@ -178,6 +178,178 @@ cleanup:
 	return ret;
 }
 
+/* Context for a named pipe listener (AF_UNIX server socket emulation) */
+struct pipe_listener_ctx {
+	char pipe_name[PATH_MAX];
+};
+
+int
+fileio_pipe_bind(struct w32_io* pio, const char* pipe_name)
+{
+	struct pipe_listener_ctx* ctx;
+
+	debug("pipe_bind: binding to \"%s\", io:%p", pipe_name, pio);
+	ctx = (struct pipe_listener_ctx*)malloc(sizeof(*ctx));
+	if (ctx == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	memset(ctx, 0, sizeof(*ctx));
+	strncpy(ctx->pipe_name, pipe_name, sizeof(ctx->pipe_name) - 1);
+	ctx->pipe_name[sizeof(ctx->pipe_name) - 1] = '\0';
+	pio->internal.context = ctx;
+	return 0;
+}
+
+static int
+fileio_pipe_create_instance(struct w32_io* pio)
+{
+	struct pipe_listener_ctx* ctx = (struct pipe_listener_ctx*)pio->internal.context;
+	wchar_t* name_w = NULL;
+	HANDLE pipe_handle;
+
+	debug("pipe_create_instance: creating pipe \"%s\", io:%p", ctx->pipe_name, pio);
+
+	name_w = utf8_to_utf16(ctx->pipe_name);
+	if (name_w == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	pipe_handle = CreateNamedPipeW(
+	    name_w,
+	    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+	    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+	    PIPE_UNLIMITED_INSTANCES,
+	    4096, 4096, 0, NULL);
+
+	free(name_w);
+
+	if (pipe_handle == INVALID_HANDLE_VALUE) {
+		debug("pipe_create_instance: CreateNamedPipeW failed, error:%d", GetLastError());
+		errno = errno_from_Win32LastError();
+		return -1;
+	}
+
+	debug("pipe_create_instance: pipe handle:%p, io:%p", pipe_handle, pio);
+	pio->handle = pipe_handle;
+
+	if (pio->read_overlapped.hEvent == NULL) {
+		pio->read_overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+		if (pio->read_overlapped.hEvent == NULL) {
+			debug("pipe_create_instance: CreateEvent failed, error:%d", GetLastError());
+			errno = errno_from_Win32LastError();
+			CloseHandle(pipe_handle);
+			pio->handle = INVALID_HANDLE_VALUE;
+			return -1;
+		}
+	} else
+		ResetEvent(pio->read_overlapped.hEvent);
+
+	pio->read_details.remaining = 0;
+	pio->read_details.pending = FALSE;
+	pio->read_details.error = 0;
+
+	if (ConnectNamedPipe(pipe_handle, &pio->read_overlapped)) {
+		debug("pipe_create_instance: ConnectNamedPipe immediate connect, io:%p", pio);
+		pio->read_details.remaining = 1;
+	} else {
+		DWORD err = GetLastError();
+		if (err == ERROR_IO_PENDING) {
+			debug("pipe_create_instance: ConnectNamedPipe pending, io:%p", pio);
+			pio->read_details.pending = TRUE;
+		} else if (err == ERROR_PIPE_CONNECTED) {
+			debug("pipe_create_instance: ConnectNamedPipe already connected, io:%p", pio);
+			pio->read_details.remaining = 1;
+		} else {
+			debug("pipe_create_instance: ConnectNamedPipe failed, error:%d, io:%p", err, pio);
+			errno = errno_from_Win32Error(err);
+			CloseHandle(pipe_handle);
+			pio->handle = INVALID_HANDLE_VALUE;
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+int
+fileio_pipe_listen(struct w32_io* pio)
+{
+	struct pipe_listener_ctx* ctx = (struct pipe_listener_ctx*)pio->internal.context;
+
+	debug("pipe_listen: io:%p", pio);
+	if (ctx == NULL) {
+		debug("pipe_listen: no context, io:%p", pio);
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (fileio_pipe_create_instance(pio) != 0)
+		return -1;
+
+	pio->internal.state = SOCK_LISTENING;
+	debug("pipe_listen: listening on \"%s\", io:%p", ctx->pipe_name, pio);
+	return 0;
+}
+
+struct w32_io*
+fileio_pipe_accept(struct w32_io* pio)
+{
+	struct w32_io* accepted;
+
+	debug("pipe_accept: called, io:%p, state:%d, pending:%d, remaining:%d",
+	    pio, pio->internal.state, pio->read_details.pending,
+	    pio->read_details.remaining);
+
+	if (pio->internal.state != SOCK_LISTENING) {
+		debug("pipe_accept: not listening, io:%p", pio);
+		errno = EINVAL;
+		return NULL;
+	}
+
+	if (pio->read_details.pending) {
+		DWORD bytes;
+		if (!GetOverlappedResult(pio->handle, &pio->read_overlapped, &bytes, FALSE)) {
+			debug("pipe_accept: GetOverlappedResult failed, error:%d, io:%p",
+			    GetLastError(), pio);
+			if (GetLastError() == ERROR_IO_INCOMPLETE)
+				errno = EAGAIN;
+			else
+				errno = errno_from_Win32LastError();
+			return NULL;
+		}
+		debug("pipe_accept: overlapped completed, io:%p", pio);
+		pio->read_details.pending = FALSE;
+	}
+
+	if (!pio->read_details.remaining) {
+		debug("pipe_accept: no connection ready, io:%p", pio);
+		errno = EAGAIN;
+		return NULL;
+	}
+
+	accepted = (struct w32_io*)malloc(sizeof(struct w32_io));
+	if (accepted == NULL) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	memset(accepted, 0, sizeof(struct w32_io));
+	accepted->handle = pio->handle;
+	accepted->type = NONSOCK_FD;
+
+	debug("pipe_accept: accepted connection, handle:%p, new_io:%p, listener_io:%p",
+	    accepted->handle, accepted, pio);
+
+	/* create a new pipe instance for the next connection */
+	pio->handle = INVALID_HANDLE_VALUE;
+	if (fileio_pipe_create_instance(pio) != 0) {
+		debug("pipe_accept: failed to create next pipe instance, error:%d", errno);
+	}
+
+	return accepted;
+}
+
 /* used to name named pipes used to implement pipe() */
 static int pipe_counter = 0;
 
@@ -1061,6 +1233,12 @@ fileio_on_select(struct w32_io* pio, BOOL rd)
 	if (!rd)
 		return;
 
+	/* ConnectNamedPipe is already managing the async state for listeners */
+	if (pio->internal.state == SOCK_LISTENING) {
+		debug5("on_select: skipping for listener, io:%p", pio);
+		return;
+	}
+
 	if (!pio->read_details.pending && !fileio_is_io_available(pio, rd))
 		/* initiate read, record any error so read() will pick up */
 		if (pio->type == NONSOCK_SYNC_FD || FILETYPE(pio) == FILE_TYPE_CHAR) {
@@ -1112,10 +1290,14 @@ fileio_close(struct w32_io* pio)
 	/* let queued APCs (if any) drain */
 	SleepEx(0, TRUE);
 	CloseHandle(WINHANDLE(pio));
+	if (pio->read_overlapped.hEvent)
+		CloseHandle(pio->read_overlapped.hEvent);
 	if (pio->read_details.buf)
 		free(pio->read_details.buf);
 	if (pio->write_details.buf)
 		free(pio->write_details.buf);
+	if (pio->internal.context)
+		free(pio->internal.context);
 	free(pio);
 
 	return 0;
@@ -1125,6 +1307,25 @@ BOOL
 fileio_is_io_available(struct w32_io* pio, BOOL rd)
 {
 	if (rd) {
+		if (pio->internal.state == SOCK_LISTENING) {
+			if (pio->read_details.remaining) {
+				debug4("is_io_available: listener ready (remaining), io:%p", pio);
+				return TRUE;
+			}
+			if (pio->read_details.pending) {
+				DWORD bytes;
+				if (GetOverlappedResult(pio->handle,
+				    &pio->read_overlapped, &bytes, FALSE)) {
+					pio->read_details.pending = FALSE;
+					pio->read_details.remaining = 1;
+					debug("is_io_available: listener connection arrived, io:%p", pio);
+					return TRUE;
+				}
+				debug5("is_io_available: listener still pending, error:%d, io:%p",
+				    GetLastError(), pio);
+			}
+			return FALSE;
+		}
 		if (pio->read_details.remaining || pio->read_details.error)
 			return TRUE;
 		else

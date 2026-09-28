@@ -338,7 +338,6 @@ int
 w32_accept(int fd, struct sockaddr* addr, int* addrlen)
 {
 	CHECK_FD(fd);
-	CHECK_SOCK_IO(fd_table.w32_ios[fd]);
 	int min_index = fd_table_get_min_index();
 	struct w32_io* pio = NULL;
 
@@ -346,11 +345,16 @@ w32_accept(int fd, struct sockaddr* addr, int* addrlen)
 		return -1;
 
 	if (fd_table.w32_ios[fd]->type == NONSOCK_FD) {
-		errno = ENOTSUP;
-		verbose("Unix domain server sockets are not supported");
-		return -1;
+		pio = fileio_pipe_accept(fd_table.w32_ios[fd]);
+		if (!pio)
+			return -1;
+		pio->type = NONSOCK_FD;
+		fd_table_set(pio, min_index);
+		debug4("pipe accept: io:%p, fd:%d", pio, min_index);
+		return min_index;
 	}
 
+	CHECK_SOCK_IO(fd_table.w32_ios[fd]);
 	pio = socketio_accept(fd_table.w32_ios[fd], addr, addrlen);
 	if (!pio)
 		return -1;
@@ -397,11 +401,8 @@ int
 w32_listen(int fd, int backlog)
 {
 	CHECK_FD(fd);
-	if (fd_table.w32_ios[fd]->type == NONSOCK_FD) {
-		errno = ENOTSUP;
-		verbose("Unix domain server sockets are not supported");
-		return -1;
-	}
+	if (fd_table.w32_ios[fd]->type == NONSOCK_FD)
+		return fileio_pipe_listen(fd_table.w32_ios[fd]);
 
 	CHECK_SOCK_IO(fd_table.w32_ios[fd]);
 	return socketio_listen(fd_table.w32_ios[fd], backlog);
@@ -412,9 +413,8 @@ w32_bind(int fd, const struct sockaddr *name, int namelen)
 {
 	CHECK_FD(fd);
 	if (fd_table.w32_ios[fd]->type == NONSOCK_FD) {
-		errno = ENOTSUP;
-		verbose("Unix domain server sockets are not supported");
-		return -1;
+		struct sockaddr_un* addr = (struct sockaddr_un*)name;
+		return fileio_pipe_bind(fd_table.w32_ios[fd], addr->sun_path);
 	}
 
 	CHECK_SOCK_IO(fd_table.w32_ios[fd]);
@@ -796,8 +796,8 @@ w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* excep
 	for (int i = 0; i < fds; i++) {
 		if (readfds && FD_ISSET(i, readfds)) {
 			w32_io_on_select(fd_table.w32_ios[i], TRUE);
-			if ((fd_table.w32_ios[i]->type == SOCK_FD) &&
-			    (fd_table.w32_ios[i]->internal.state == SOCK_LISTENING)) {
+			if (fd_table.w32_ios[i]->internal.state == SOCK_LISTENING &&
+			    fd_table.w32_ios[i]->read_overlapped.hEvent != NULL) {
 				if (num_events == SELECT_EVENT_LIMIT) {
 					debug3("select - ERROR: max #events breach");
 					errno = ENOMEM;
